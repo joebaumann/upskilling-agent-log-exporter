@@ -1,0 +1,1666 @@
+#!/usr/bin/env python3
+"""agent-logs — bundle local coding-agent session logs into one shareable zip.
+
+The original transcript files are copied byte-for-byte; nothing is rewritten,
+summarised or uploaded. Whoever receives the zip parses it later with
+parser/parse_agent_logs.py; running this script needs none of that.
+
+Two agents keep their conversations in SQLite rather than in files (OpenCode,
+Cursor). For those the rows are exported to JSONL/JSON inside the zip so that
+date filtering and per-session exclusion work the same way everywhere.
+
+macOS, Linux and Windows. Python 3.9+, standard library only.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import sys
+import zipfile
+from collections import defaultdict
+from datetime import date, datetime, time as dtime, timedelta, timezone
+from pathlib import Path
+
+VERSION = "2.0.0"
+
+# --------------------------------------------------------------------------- #
+# Agents
+# --------------------------------------------------------------------------- #
+
+AGENT_KEYS = ["claude", "codex", "opencode", "gemini",
+              "droid", "copilot", "cursor", "pi"]
+
+LABELS = {
+    "claude": "Claude Code",
+    "codex": "Codex",
+    "opencode": "OpenCode",
+    "gemini": "Gemini CLI",
+    "droid": "Factory AI Droid",
+    "copilot": "Copilot CLI",
+    "cursor": "Cursor",
+    "pi": "Pi",
+}
+
+# Spellings people are likely to type for --agents.
+ALIASES = {
+    "claude-code": "claude", "claudecode": "claude", "cc": "claude",
+    "openai-codex": "codex", "codex-cli": "codex",
+    "open-code": "opencode", "oc": "opencode",
+    "gemini-cli": "gemini", "google": "gemini",
+    "factory": "droid", "factory-droid": "droid", "factory-ai-droid": "droid",
+    "copilot-cli": "copilot", "gh-copilot": "copilot", "github-copilot": "copilot",
+    "cursor-agent": "cursor",
+    "pi-cli": "pi",
+}
+
+# Artifact kinds; each maps to an --no-* opt-out flag.
+KINDS = ["session", "subagent", "metadata", "tool-result", "image", "memory"]
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".pdf"}
+TRANSCRIPT_SUFFIXES = {".json", ".jsonl"}
+IGNORED_NAMES = {".DS_Store", "Thumbs.db", ".gitkeep"}
+
+
+# --------------------------------------------------------------------------- #
+# Where each agent keeps its logs, per platform
+# --------------------------------------------------------------------------- #
+
+def _env_paths(*names):
+    """Directories named by env vars, honouring ':'/';'/',' separated lists."""
+    out = []
+    for name in names:
+        raw = os.environ.get(name)
+        if not raw:
+            continue
+        for chunk in re.split(r"[%s,]" % re.escape(os.pathsep), raw):
+            chunk = chunk.strip()
+            if chunk:
+                out.append(Path(chunk).expanduser())
+    return out
+
+
+def _data_dirs():
+    """Per-user data roots, in the order a CLI tool would pick them."""
+    home = Path.home()
+    dirs = _env_paths("XDG_DATA_HOME") or [home / ".local" / "share"]
+    if os.name == "nt":
+        dirs += _env_paths("LOCALAPPDATA", "APPDATA")
+    if sys.platform == "darwin":
+        dirs.append(home / "Library" / "Application Support")
+    return dirs
+
+
+def _app_dirs():
+    """Per-user config roots, where Electron apps (Cursor) store state."""
+    home = Path.home()
+    if os.name == "nt":
+        return _env_paths("APPDATA", "LOCALAPPDATA")
+    if sys.platform == "darwin":
+        return [home / "Library" / "Application Support"]
+    return _env_paths("XDG_CONFIG_HOME") or [home / ".config"]
+
+
+def default_roots(agent):
+    """Candidate log roots for one agent. Non-existent ones are dropped later."""
+    home = Path.home()
+    if agent == "claude":
+        return [p / "projects" for p in _env_paths("CLAUDE_CONFIG_DIR")] \
+            or [home / ".claude" / "projects"]
+    if agent == "codex":
+        return [p / "sessions" for p in _env_paths("CODEX_HOME")] \
+            or [home / ".codex" / "sessions"]
+    if agent == "opencode":
+        roots = _env_paths("OPENCODE_DATA", "OPENCODE_CONFIG")
+        roots += [d / "opencode" for d in _data_dirs()]
+        return roots
+    if agent == "gemini":
+        return [p / "tmp" for p in _env_paths("GEMINI_DIR")] \
+            or [home / ".gemini" / "tmp"]
+    if agent == "droid":
+        return [home / ".factory" / "sessions"]
+    if agent == "copilot":
+        # Newer builds use ~/.copilot/history-session-state; older ones history/.
+        return [home / ".copilot" / "history",
+                home / ".copilot" / "history-session-state"]
+    if agent == "cursor":
+        # Two unrelated layouts: the cursor-agent CLI writes JSONL under
+        # ~/.cursor/projects, the IDE keeps chats in a SQLite state store.
+        # Both are checked; whichever exist are scanned and merged.
+        return [home / ".cursor" / "projects"] \
+            + [d / "Cursor" / "User" for d in _app_dirs()]
+    if agent == "pi":
+        return [home / ".pi" / "sessions"]
+    return []
+
+
+# --------------------------------------------------------------------------- #
+# Small helpers
+# --------------------------------------------------------------------------- #
+
+def human_bytes(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:,.1f} {unit}"
+        n /= 1024.0
+
+
+def human_duration(seconds):
+    """First-to-last-activity span. A resumed session can span days."""
+    if seconds is None or seconds < 0:
+        return "-"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    d, h = divmod(h, 24)
+    if d:
+        return f"{d}d{h:02d}h"
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+def normalize_ts(value):
+    """A datetime (UTC) from an ISO string or an epoch in s/ms/us/ns."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        v = float(value)
+        if v <= 0:
+            return None
+        for scale in (1.0, 1e3, 1e6, 1e9):          # s, ms, us, ns
+            t = v / scale
+            if 1e9 < t < 4e9:                        # 2001-2096, sane range
+                try:
+                    return datetime.fromtimestamp(t, tz=timezone.utc)
+                except (OverflowError, OSError, ValueError):
+                    return None
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.isdigit():
+            return normalize_ts(int(text))
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        # A bare timestamp with no zone is read as UTC: agents that write ISO
+        # strings write them in UTC, and guessing local time would shift days.
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None \
+            else dt.astimezone(timezone.utc)
+    return None
+
+
+TS_KEYS = ("timestamp", "time_created", "createdAt", "created_at", "created",
+           "startTime", "start_time", "time", "ts", "date", "updatedAt",
+           "time_updated", "lastUpdated", "endTime")
+CWD_KEYS = ("cwd", "directory", "workspacePath", "workspace_path", "projectPath",
+            "project_path", "workingDirectory", "working_directory", "worktree",
+            "folder", "root", "workspaceRoot")
+SID_KEYS = ("sessionId", "session_id", "sessionID", "conversationId", "id")
+NESTED_KEYS = ("payload", "info", "message", "session", "data", "meta",
+               "turn_context", "state")
+
+# role: user records the harness wrote rather than the human. Only used to pick
+# a preview line for the exclusion menu, so a rough list is enough.
+INJECTED_PREFIXES = (
+    "<command-name>", "<command-message>", "<command-args>", "<local-command",
+    "<system-reminder>", "<system_instruction", "<task-notification>",
+    "<teammate-message", "<bash-input>", "<bash-stdout>", "<bash-stderr>",
+    "<user-prompt-submit-hook>", "<ide_", "<environment_context>",
+    "<user_instructions>", "Caveat:", "This session is being continued",
+    "Base directory for this skill:", "[Request interrupted",
+)
+
+
+def _scan_record(rec, found):
+    """Harvest timestamps / cwd / session id from one record, in place."""
+    if not isinstance(rec, dict):
+        return
+    for key in TS_KEYS:
+        if key in rec:
+            ts = normalize_ts(rec[key])
+            if ts:
+                found["times"].append(ts)
+                break
+    for key in CWD_KEYS:
+        val = rec.get(key)
+        if isinstance(val, str) and val and not found["cwd"]:
+            if key == "folder" and val.startswith(("file://", "vscode-remote://")):
+                val = _uri_to_path(val)
+            if val not in ("/", ".", ""):
+                found["cwd"] = val
+                break
+    if not found["sid"]:
+        for key in SID_KEYS:
+            val = rec.get(key)
+            if isinstance(val, str) and 8 <= len(val) <= 128:
+                found["sid"] = val
+                break
+
+
+def _uri_to_path(uri):
+    """file:///a/b -> /a/b; remote URIs keep their host so they stay distinct."""
+    from urllib.parse import unquote, urlparse
+    parsed = urlparse(uri)
+    path = unquote(parsed.path)
+    if parsed.scheme == "file":
+        # Windows: file:///C:/x -> C:/x
+        return path[1:] if re.match(r"^/[A-Za-z]:", path) else path
+    return f"{parsed.scheme}://{parsed.netloc}{path}"
+
+
+def _record_text(rec):
+    """Plain text of a record's user-facing content, or ''."""
+    msg = rec.get("message") if isinstance(rec.get("message"), (dict, str)) else None
+    content = None
+    if isinstance(msg, str):
+        content = msg
+    elif isinstance(msg, dict):
+        content = msg.get("content")
+    if content is None:
+        content = rec.get("content") or rec.get("text") or rec.get("prompt")
+    if isinstance(content, str):
+        return content
+    out = []
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, str):
+                out.append(block)
+            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                out.append(block["text"])
+    return "\n".join(out)
+
+
+def _is_user_record(rec):
+    role = rec.get("role")
+    if not role:
+        msg = rec.get("message")
+        if isinstance(msg, dict):
+            role = msg.get("role")
+    rtype = rec.get("type") or ""
+    return role == "user" or rtype in ("user", "user.message", "user_message")
+
+
+MESSAGE_TYPES = {"user", "assistant", "message", "response_item", "user.message",
+                 "assistant.message", "user_message", "agent_message",
+                 "assistant.turn_start", "tool.execution_complete"}
+
+
+def _is_message_record(rec):
+    if rec.get("type") in MESSAGE_TYPES:
+        return True
+    return "role" in rec or isinstance(rec.get("message"), (dict, str))
+
+
+def peek_transcript(path):
+    """Light metadata scan of one transcript. Never builds a trajectory.
+
+    Returns dict(times, cwd, sid, records, preview) — enough to date-filter,
+    group by project and label a session in the exclusion menu.
+    """
+    found = {"times": [], "cwd": None, "sid": None, "records": 0, "preview": None}
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return found
+    stripped = raw.lstrip()
+    docs = []
+    if stripped.startswith(("{", "[")):
+        try:                                  # single JSON document
+            doc = json.loads(raw)
+            docs = doc if isinstance(doc, list) else [doc]
+            for container in ("messages", "entries", "history", "conversation"):
+                if isinstance(doc, dict) and isinstance(doc.get(container), list):
+                    docs = [doc] + [m for m in doc[container] if isinstance(m, dict)]
+                    break
+        except (json.JSONDecodeError, ValueError):
+            docs = []
+    if not docs:                              # JSONL
+        docs = []
+        # "\n" only: str.splitlines() also breaks on U+2028 and U+0085, which
+        # occur raw inside JSON strings and would split a record in two.
+        for line in raw.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(rec, dict):
+                docs.append(rec)
+
+    for rec in docs:
+        if not isinstance(rec, dict):
+            continue
+        _scan_record(rec, found)
+        for key in NESTED_KEYS:
+            nested = rec.get(key)
+            if isinstance(nested, dict):
+                _scan_record(nested, found)
+        if _is_message_record(rec):
+            found["records"] += 1
+        if found["preview"] is None and _is_user_record(rec):
+            text = _record_text(rec).strip()
+            if text and not text.startswith(INJECTED_PREFIXES) and not rec.get("isMeta"):
+                found["preview"] = " ".join(text.split())[:70]
+    return found
+
+
+# --------------------------------------------------------------------------- #
+# Scan results
+# --------------------------------------------------------------------------- #
+
+class Artifact:
+    """One file destined for the zip: either on disk, or synthesized in memory."""
+
+    __slots__ = ("kind", "arc", "path", "data", "size")
+
+    def __init__(self, kind, arc, path=None, data=None):
+        self.kind = kind
+        self.arc = arc
+        self.path = path
+        self.data = data
+        if data is not None:
+            self.size = len(data)
+        else:
+            try:
+                self.size = path.stat().st_size
+            except OSError:
+                self.size = 0
+
+
+class Session:
+    """One agent session, plus every file that belongs to it."""
+
+    __slots__ = ("agent", "session_id", "project", "started", "ended",
+                 "records", "preview", "artifacts", "group", "ts_from_mtime")
+
+    def __init__(self, agent, session_id, project, started, ended,
+                 records, preview, group, ts_from_mtime=False):
+        self.agent = agent
+        self.session_id = session_id
+        self.project = project or "(unknown project)"
+        self.started = started
+        self.ended = ended or started
+        self.records = records
+        self.preview = preview
+        self.artifacts = []
+        self.group = group           # extras of this group ride along
+        self.ts_from_mtime = ts_from_mtime
+
+    @property
+    def size(self):
+        return sum(a.size for a in self.artifacts)
+
+    def kept_artifacts(self, kinds):
+        return [a for a in self.artifacts if a.kind in kinds]
+
+
+def _mtime(path):
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        return None
+
+
+def _session_from_peek(agent, path, arc, group, session_id=None, project=None):
+    info = peek_transcript(path)
+    times = info["times"]
+    from_mtime = not times
+    started = min(times) if times else _mtime(path)
+    ended = max(times) if times else started
+    sess = Session(agent, session_id or info["sid"] or path.stem,
+                   project or info["cwd"], started, ended,
+                   info["records"], info["preview"], group, from_mtime)
+    sess.artifacts.append(Artifact("session", arc, path=path))
+    return sess
+
+
+# --------------------------------------------------------------------------- #
+# Scanners
+# --------------------------------------------------------------------------- #
+
+def _iter_files(root):
+    """Every regular file under root. Symlinks are not followed."""
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [d for d in dirnames
+                       if not (Path(dirpath) / d).is_symlink()]
+        for name in sorted(filenames):
+            path = Path(dirpath) / name
+            if name in IGNORED_NAMES or path.is_symlink():
+                continue
+            if not path.is_file():        # sockets, FIFOs — ~/.cursor has one
+                continue
+            yield path
+
+
+def _kind_for(path):
+    if path.suffix.lower() in IMAGE_SUFFIXES:
+        return "image"
+    if path.name.endswith(".meta.json"):
+        return "metadata"
+    return "tool-result"
+
+
+def scan_claude(root, arc_prefix):
+    """Claude Code: <slug>/<session>.jsonl plus per-session artifact folders.
+
+    A project folder also holds files that belong to no single session
+    (memory/, sessions-index.json); they ride along with their project.
+    """
+    sessions, extras = [], defaultdict(list)
+    if not root.is_dir():
+        return sessions, extras
+    for slug_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        if slug_dir.is_symlink():
+            continue
+        group = f"claude:{slug_dir.name}"
+        by_id, in_slug = {}, []
+        for path in sorted(slug_dir.glob("*.jsonl")):
+            arc = f"{arc_prefix}/{slug_dir.name}/{path.name}"
+            sess = _session_from_peek("claude", path, arc, group)
+            by_id[path.stem] = sess
+            in_slug.append(sess)
+            sessions.append(sess)
+        # A session with no cwd of its own (a title-only stub left by /fork, or
+        # a renamed session) still belongs to this folder's project.
+        fallback = _majority_cwd(in_slug) or str(slug_dir)
+        for sess in in_slug:
+            if sess.project == "(unknown project)":
+                sess.project = fallback
+        for child in sorted(slug_dir.iterdir()):
+            if child.is_symlink():
+                continue
+            if child.is_dir() and child.name in by_id:          # session sidecar dir
+                host = by_id[child.name]
+                for path in _iter_files(child):
+                    rel = path.relative_to(slug_dir).as_posix()
+                    kind = "subagent" if (path.suffix == ".jsonl"
+                                          and "subagents" in path.parts) \
+                        else _kind_for(path)
+                    host.artifacts.append(
+                        Artifact(kind, f"{arc_prefix}/{slug_dir.name}/{rel}", path=path))
+            elif child.is_dir():                                # memory/, orphan dirs
+                for path in _iter_files(child):
+                    rel = path.relative_to(slug_dir).as_posix()
+                    kind = "memory" if child.name == "memory" else _kind_for(path)
+                    extras[group].append(
+                        Artifact(kind, f"{arc_prefix}/{slug_dir.name}/{rel}", path=path))
+            elif child.suffix != ".jsonl" and child.name not in IGNORED_NAMES:
+                extras[group].append(
+                    Artifact("metadata", f"{arc_prefix}/{slug_dir.name}/{child.name}",
+                             path=child))
+    return sessions, extras
+
+
+def _majority_cwd(sessions):
+    counts = _count_by([s for s in sessions if s.project != "(unknown project)"],
+                       lambda s: s.project)
+    return max(counts, key=counts.get) if counts else None
+
+
+def scan_files(agent, root, arc_prefix):
+    """Generic file-based agent: one transcript file is one session."""
+    sessions = []
+    for path in _iter_files(root):
+        if path.suffix.lower() not in TRANSCRIPT_SUFFIXES:
+            continue
+        try:
+            rel = path.relative_to(root).as_posix()
+        except ValueError:
+            rel = path.name
+        sessions.append(_session_from_peek(
+            agent, path, f"{arc_prefix}/{rel}", f"{agent}:{root}"))
+    return sessions, {}
+
+
+# --------------------------------------------------------------------------- #
+# SQLite-backed agents: rows are exported to files inside the zip
+# --------------------------------------------------------------------------- #
+
+def _open_ro(db_path):
+    """Open a SQLite file read-only, on a private copy of any hot WAL."""
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        con.execute("select 1")
+        return con
+    except Exception:
+        return None
+
+
+def scan_opencode(root, arc_prefix):
+    """OpenCode keeps sessions in opencode.db; export one bundle per session.
+
+    The bundle shape ({info, messages:[{info, parts}]}) is the same one
+    OpenCode itself exports, so the parser reads it with no special case.
+    """
+    dbs = [p for p in sorted(root.glob("*.db")) if p.is_file()]
+    sessions = []
+    for db in dbs:
+        con = _open_ro(db)
+        if con is None:
+            continue
+        try:
+            rows = con.execute(
+                "SELECT id, directory, title, time_created, time_updated, "
+                "       slug, parent_id, project_id, agent, model, version "
+                "FROM session").fetchall()
+        except Exception:
+            con.close()
+            continue
+        cols = ("id", "directory", "title", "time_created", "time_updated",
+                "slug", "parent_id", "project_id", "agent", "model", "version")
+        infos = {r[0]: dict(zip(cols, r)) for r in rows}
+        try:
+            msg_rows = con.execute(
+                "SELECT id, session_id, time_created, time_updated, data "
+                "FROM message ORDER BY session_id, time_created, id").fetchall()
+            part_rows = con.execute(
+                "SELECT message_id, id, time_created, data "
+                "FROM part ORDER BY message_id, time_created, id").fetchall()
+        except Exception:
+            con.close()
+            continue
+        con.close()
+
+        parts_by_msg = defaultdict(list)
+        for message_id, part_id, created, data in part_rows:
+            parts_by_msg[message_id].append(
+                _json_or_raw(data, {"id": part_id, "time_created": created}))
+
+        msgs_by_session = defaultdict(list)
+        for mid, sid, created, updated, data in msg_rows:
+            info = _json_or_raw(data, {"id": mid, "time_created": created,
+                                       "time_updated": updated})
+            msgs_by_session[sid].append({"info": info, "parts": parts_by_msg.get(mid, [])})
+
+        stem = db.stem
+        for sid, info in infos.items():
+            messages = msgs_by_session.get(sid, [])
+            if not messages:
+                continue
+            bundle = {
+                "info": {
+                    "id": sid,
+                    "directory": info.get("directory"),
+                    "title": info.get("title"),
+                    "slug": info.get("slug"),
+                    "parentID": info.get("parent_id"),
+                    "projectID": info.get("project_id"),
+                    "agent": info.get("agent"),
+                    "model": info.get("model"),
+                    "version": info.get("version"),
+                    "time": {"created": info.get("time_created"),
+                             "updated": info.get("time_updated")},
+                },
+                "messages": messages,
+            }
+            data = json.dumps(bundle, ensure_ascii=False).encode("utf-8")
+            arc = f"{arc_prefix}/{stem}/{sid}.json"
+            times = [t for t in (normalize_ts(info.get("time_created")),
+                                 normalize_ts(info.get("time_updated"))) if t]
+            for m in messages:
+                ts = normalize_ts((m["info"] or {}).get("time_created"))
+                if ts:
+                    times.append(ts)
+            preview = _opencode_preview(messages)
+            sess = Session("opencode", sid, info.get("directory"),
+                           min(times) if times else None,
+                           max(times) if times else None,
+                           len(messages), preview, f"opencode:{db}")
+            sess.artifacts.append(Artifact("session", arc, data=data))
+            sessions.append(sess)
+    return sessions, {}
+
+
+def _json_or_raw(data, extra):
+    try:
+        obj = json.loads(data) if isinstance(data, str) else data
+    except (json.JSONDecodeError, ValueError, TypeError):
+        obj = {"raw": data}
+    if not isinstance(obj, dict):
+        obj = {"raw": obj}
+    for key, val in extra.items():
+        obj.setdefault(key, val)
+    return obj
+
+
+def _opencode_preview(messages):
+    for m in messages:
+        if (m.get("info") or {}).get("role") != "user":
+            continue
+        for part in m.get("parts") or []:
+            if isinstance(part, dict) and part.get("type") == "text" \
+                    and part.get("text") and not part.get("synthetic"):
+                return " ".join(part["text"].split())[:70]
+    return None
+
+
+def scan_cursor(root, arc_prefix):
+    """Dispatch on which of Cursor's two layouts this root is."""
+    if (root / "globalStorage").is_dir() or (root / "workspaceStorage").is_dir():
+        return _scan_cursor_ide(root, arc_prefix)
+    return _scan_cursor_cli(root, arc_prefix)
+
+
+def _scan_cursor_cli(root, arc_prefix):
+    """cursor-agent: <root>/<slug>/agent-transcripts/<id>/<id>.jsonl.
+
+    The transcript itself carries no timestamps and only a mangled project
+    slug, but a sidecar under ~/.cursor/chats/<hash>/<id>/ has the exact cwd
+    and the created/updated times. Those sidecars travel with the session so
+    nothing about it is guessed later.
+    """
+    sidecars = {}
+    chats = root.parent / "chats"
+    if chats.is_dir():
+        for meta in chats.glob("*/*/meta.json"):
+            sidecars[meta.parent.name] = meta.parent
+
+    sessions = []
+    for transcript in sorted(root.glob("*/agent-transcripts/*/*.jsonl")):
+        slug = transcript.relative_to(root).parts[0]
+        session_id = transcript.parent.name
+        rel = transcript.relative_to(root).as_posix()
+        sess = _session_from_peek("cursor", transcript, f"{arc_prefix}/{rel}",
+                                  f"cursor:{slug}", session_id=session_id)
+
+        side = sidecars.get(session_id)
+        if side is not None:
+            meta = {}
+            try:
+                meta = json.loads((side / "meta.json").read_text(
+                    encoding="utf-8", errors="replace")) or {}
+            except (OSError, json.JSONDecodeError, ValueError):
+                meta = {}
+            if meta.get("cwd"):
+                sess.project = meta["cwd"]
+            created = normalize_ts(meta.get("createdAtMs"))
+            updated = normalize_ts(meta.get("updatedAtMs"))
+            if created:
+                sess.started, sess.ended = created, updated or created
+                sess.ts_from_mtime = False
+            # meta.json, prompt_history.json and the blob store are the rest of
+            # what Cursor kept about this session; keep them beside it.
+            for extra in sorted(_iter_files(side)):
+                sess.artifacts.append(Artifact(
+                    "metadata",
+                    f"{arc_prefix}/{transcript.parent.relative_to(root).as_posix()}"
+                    f"/cursor-chat/{extra.name}", path=extra))
+        if sess.project == "(unknown project)":
+            sess.project = str(root / slug)
+        sessions.append(sess)
+    return sessions, {}
+
+
+def _scan_cursor_ide(root, arc_prefix):
+    """Cursor IDE stores chats in state.vscdb; export one JSONL per composer.
+
+    Best effort: Cursor's schema is undocumented and has changed several times.
+    Rows that do not match a known shape are still written out verbatim, so
+    nothing is silently lost.
+    """
+    sessions = []
+    global_db = root / "globalStorage" / "state.vscdb"
+    folders = {}                                     # composerId -> workspace folder
+    ws_root = root / "workspaceStorage"
+    if ws_root.is_dir():
+        for ws_dir in sorted(p for p in ws_root.iterdir() if p.is_dir()):
+            folder = None
+            meta = ws_dir / "workspace.json"
+            if meta.is_file():
+                try:
+                    raw = json.loads(meta.read_text(encoding="utf-8", errors="replace"))
+                    uri = raw.get("folder") or raw.get("workspace")
+                    folder = _uri_to_path(uri) if isinstance(uri, str) else None
+                except (OSError, json.JSONDecodeError, ValueError):
+                    folder = None
+            db = ws_dir / "state.vscdb"
+            if not db.is_file():
+                continue
+            con = _open_ro(db)
+            if con is None:
+                continue
+            try:
+                for key, value in con.execute(
+                        "SELECT key, value FROM ItemTable WHERE key LIKE '%omposer%' "
+                        "OR key LIKE '%aichat%' OR key LIKE '%chatdata%'"):
+                    for cid in _cursor_composer_ids(value):
+                        folders[cid] = folder
+                    sess = _cursor_workspace_session(
+                        key, value, folder, ws_dir.name, arc_prefix)
+                    if sess:
+                        sessions.append(sess)
+            except Exception:
+                pass
+            con.close()
+
+    if global_db.is_file():
+        sessions += _cursor_global_sessions(global_db, folders, arc_prefix)
+    return sessions, {}
+
+
+def _cursor_composer_ids(value):
+    try:
+        obj = json.loads(value) if isinstance(value, (str, bytes)) else None
+    except (json.JSONDecodeError, ValueError):
+        return []
+    ids = []
+    if isinstance(obj, dict):
+        for entry in obj.get("allComposers") or []:
+            if isinstance(entry, dict) and isinstance(entry.get("composerId"), str):
+                ids.append(entry["composerId"])
+    return ids
+
+
+def _cursor_workspace_session(key, value, folder, ws_name, arc_prefix):
+    """Legacy in-workspace chat blobs (workbench.panel.aichat.…chatdata)."""
+    if "chatdata" not in key.lower():
+        return None
+    try:
+        obj = json.loads(value) if isinstance(value, (str, bytes)) else None
+    except (json.JSONDecodeError, ValueError):
+        return None
+    tabs = (obj or {}).get("tabs") if isinstance(obj, dict) else None
+    if not isinstance(tabs, list) or not tabs:
+        return None
+    lines, count, preview = [], 0, None
+    header = {"cursor_session": {"source": key, "workspace": ws_name,
+                                 "directory": folder}}
+    lines.append(json.dumps(header, ensure_ascii=False))
+    for tab in tabs:
+        if not isinstance(tab, dict):
+            continue
+        for bubble in tab.get("bubbles") or []:
+            if not isinstance(bubble, dict):
+                continue
+            role = "user" if bubble.get("type") == "user" else "assistant"
+            text = bubble.get("text") or bubble.get("rawText") or ""
+            lines.append(json.dumps({"role": role, "message": text,
+                                     "cursor_raw": bubble}, ensure_ascii=False))
+            count += 1
+            if role == "user" and preview is None and text.strip():
+                preview = " ".join(text.split())[:70]
+    if count == 0:
+        return None
+    data = ("\n".join(lines) + "\n").encode("utf-8")
+    arc = f"{arc_prefix}/workspace-{ws_name}/chatdata.jsonl"
+    # These bubbles carry no timestamps at all, so the session is undateable;
+    # in_window() keeps it rather than dropping it on a guess.
+    sess = Session("cursor", f"{ws_name}-chatdata", folder, None, None,
+                   count, preview, f"cursor:{ws_name}")
+    sess.artifacts.append(Artifact("session", arc, data=data))
+    return sess
+
+
+def _cursor_global_sessions(db_path, folders, arc_prefix):
+    """globalStorage: composerData:<id> headers plus bubbleId:<id>:<n> messages."""
+    con = _open_ro(db_path)
+    if con is None:
+        return []
+    try:
+        rows = con.execute(
+            "SELECT key, value FROM cursorDiskKV "
+            "WHERE key LIKE 'composerData:%' OR key LIKE 'bubbleId:%'").fetchall()
+    except Exception:
+        con.close()
+        return []
+    con.close()
+
+    headers, bubbles = {}, defaultdict(list)
+    for key, value in rows:
+        try:
+            obj = json.loads(value) if isinstance(value, (str, bytes)) else None
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if key.startswith("composerData:"):
+            headers[key.split(":", 1)[1]] = obj
+        else:
+            parts = key.split(":")
+            if len(parts) >= 3:
+                bubbles[parts[1]].append((parts[2], obj))
+
+    sessions = []
+    for cid, header in headers.items():
+        order = [h.get("bubbleId") for h in header.get("fullConversationHeadersOnly") or []
+                 if isinstance(h, dict)]
+        found = dict(bubbles.get(cid, []))
+        ordered = [(bid, found[bid]) for bid in order if bid in found]
+        ordered += [(bid, obj) for bid, obj in sorted(bubbles.get(cid, []))
+                    if bid not in set(order)]
+        # conversationMap is the older inline form of the same messages.
+        inline = header.get("conversationMap")
+        if not ordered and isinstance(inline, dict):
+            ordered = sorted(inline.items())
+        if not ordered:
+            continue
+
+        folder = folders.get(cid)
+        lines = [json.dumps({"cursor_session": {
+            "composerId": cid, "directory": folder,
+            "name": header.get("name"), "createdAt": header.get("createdAt"),
+            "lastUpdatedAt": header.get("lastUpdatedAt")}}, ensure_ascii=False)]
+        times = [t for t in (normalize_ts(header.get("createdAt")),
+                             normalize_ts(header.get("lastUpdatedAt"))) if t]
+        preview, count = None, 0
+        for _bid, bubble in ordered:
+            if not isinstance(bubble, dict):
+                continue
+            role = "user" if bubble.get("type") == 1 or bubble.get("role") == "user" \
+                else "assistant"
+            text = bubble.get("text") or bubble.get("richText") or ""
+            if not isinstance(text, str):
+                text = json.dumps(text, ensure_ascii=False)
+            lines.append(json.dumps({"role": role, "message": text,
+                                     "cursor_raw": bubble}, ensure_ascii=False))
+            count += 1
+            if role == "user" and preview is None and text.strip():
+                preview = " ".join(text.split())[:70]
+        data = ("\n".join(lines) + "\n").encode("utf-8")
+        sess = Session("cursor", cid, folder,
+                       min(times) if times else None,
+                       max(times) if times else None,
+                       count, preview, f"cursor:{db_path}")
+        sess.artifacts.append(Artifact("session", f"{arc_prefix}/{cid}.jsonl", data=data))
+        sessions.append(sess)
+    return sessions
+
+
+SCANNERS = {
+    "claude": scan_claude,
+    "opencode": scan_opencode,
+    "cursor": scan_cursor,
+}
+
+
+def scan_agent(agent, roots):
+    """Scan every existing root for one agent, de-duplicating arcnames."""
+    sessions, extras = [], {}
+    live = [r for r in roots if r.exists()]
+    for index, root in enumerate(live):
+        prefix = f"logs/{agent}" if len(live) == 1 else f"logs/{agent}/root{index + 1}"
+        scanner = SCANNERS.get(agent)
+        try:
+            # Agents with their own scanner take (root, prefix); everything
+            # else goes through the generic one, which also needs the key.
+            found, found_extras = (scanner(root, prefix) if scanner
+                                   else scan_files(agent, root, prefix))
+        except OSError as exc:
+            print(f"  ! {LABELS[agent]}: cannot read {root} ({exc})", file=sys.stderr)
+            continue
+        sessions += found
+        extras.update(found_extras)
+    return sessions, extras
+
+
+# --------------------------------------------------------------------------- #
+# Dates
+# --------------------------------------------------------------------------- #
+
+def parse_date_arg(value, what):
+    """YYYY-MM-DD, 'Nd' (N days back), or 'all'."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in ("all", "none", ""):
+        return None
+    match = re.fullmatch(r"(\d+)\s*d(ays?)?", text)
+    if match:
+        # "31d" is the last 31 days *including today*, so the window really is
+        # 31 days long rather than 32.
+        return date.today() - timedelta(days=max(int(match.group(1)) - 1, 0))
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{what}: expected YYYY-MM-DD, Nd or all — got {value!r}")
+
+
+def local_window(start_date, end_date):
+    """Local-midnight bounds as aware UTC datetimes; end is exclusive."""
+    tz = datetime.now().astimezone().tzinfo
+    start = datetime.combine(start_date, dtime.min, tz).astimezone(timezone.utc) \
+        if start_date else None
+    end = datetime.combine(end_date + timedelta(days=1), dtime.min, tz) \
+        .astimezone(timezone.utc) if end_date else None
+    return start, end
+
+
+def describe_window(start_date, end_date, defaulted):
+    """One line saying exactly which days are being considered."""
+    zone = datetime.now().astimezone().strftime("%Z") or "local time"
+    if start_date is None:
+        span = f"everything up to and including {end_date}"
+    else:
+        days = (end_date - start_date).days + 1
+        span = f"{start_date} to {end_date} ({days} day{'s' if days != 1 else ''})"
+    suffix = "  [default: last 31 days; set --start-date / --end-date to change]" \
+        if defaulted else f"  [{zone} dates, both ends inclusive]"
+    return f"Window: {span}{suffix}"
+
+
+def in_window(sess, start, end):
+    """A session counts if its activity overlaps the window at all."""
+    first, last = sess.started, sess.ended or sess.started
+    if first is None and last is None:
+        return True                      # undateable: keep, flagged in manifest
+    if start and (last or first) < start:
+        return False
+    if end and (first or last) >= end:
+        return False
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# Interactive selection
+# --------------------------------------------------------------------------- #
+
+def ask_yes_no(question, default=True):
+    suffix = "[Y/n]" if default else "[y/N]"
+    while True:
+        try:
+            answer = input(f"{question} {suffix} ").strip().lower()
+        except EOFError:
+            return default
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        print("  please answer y or n.")
+
+
+def parse_selection(text, count):
+    """'2 5 7-9' or '2,5,7-9' -> {2,5,7,8,9}; None if anything is out of range."""
+    picked = set()
+    # "12 - 15" should read the same as "12-15".
+    text = re.sub(r"\s*-\s*", "-", text.strip())
+    for token in re.split(r"[\s,]+", text):
+        if not token:
+            continue
+        match = re.fullmatch(r"(\d+)(?:\s*-\s*(\d+))?", token)
+        if not match:
+            print(f"  '{token}' is not a number or range.")
+            return None
+        low = int(match.group(1))
+        high = int(match.group(2) or low)
+        if low < 1 or high > count or low > high:
+            print(f"  '{token}' is outside 1-{count}.")
+            return None
+        picked.update(range(low, high + 1))
+    return picked
+
+
+def ask_numbers(question, count):
+    """Ask for a set of list numbers, re-asking until the answer parses."""
+    while True:
+        print(question)
+        print(f'    numbers from the list above — "3 7 12-15" or "3,7,12-15" '
+              f'(1-{count}); blank = none')
+        try:
+            text = input("  > ").strip()
+        except EOFError:
+            return set()
+        if not text:
+            return set()
+        picked = parse_selection(text, count)
+        if picked is not None:
+            return picked
+
+
+def fmt_ts(dt):
+    if dt is None:
+        return "unknown date"
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def choose_sessions(sessions, quiet=False):
+    """The y/n + numbered-exclusion wizard. Returns the sessions to export."""
+    by_project = defaultdict(list)
+    for sess in sessions:
+        by_project[sess.project].append(sess)
+    projects = sorted(by_project, key=lambda p: (-len(by_project[p]), p))
+
+    width = len(str(len(projects)))
+    print(f"\n{len(projects)} project(s) with sessions in the window:\n")
+    for index, project in enumerate(projects, 1):
+        group = by_project[project]
+        agents = ", ".join(f"{LABELS[a]} {n}" for a, n in
+                           sorted(_count_by(group, lambda s: s.agent).items()))
+        print(f"  [{index:>{width}}]  {project}")
+        print(f"   {'':>{width}}   {len(group)} session(s), "
+              f"{human_bytes(sum(s.size for s in group))} — {agents}")
+
+    if ask_yes_no(f"\nExport all {len(projects)} project(s)?", default=True):
+        return list(sessions)
+
+    picked = ask_numbers(
+        "\nWhich projects should NOT be exported in full? Each one you pick "
+        "is\n  then listed session by session, so you can keep some of it.",
+        len(projects))
+    if not picked:
+        print("  nothing picked — exporting all projects.")
+        return list(sessions)
+
+    print(f"\n  Picked {len(picked)} project(s) to go through:")
+    for number in sorted(picked):
+        print(f"    [{number}] {projects[number - 1]}")
+
+    keep, position = [], 0
+    for index, project in enumerate(projects, 1):
+        if index not in picked:
+            keep += by_project[project]
+            continue
+        position += 1
+        keep += _choose_within_project(project, by_project[project],
+                                       index, position, len(picked))
+    return keep
+
+
+def _choose_within_project(project, sessions, number, position, total):
+    ordered = sorted(sessions, key=lambda s: (s.started or datetime.max.replace(
+        tzinfo=timezone.utc), s.session_id))
+    print(f"\n  ─── project [{number}] — {position} of {total} to go through "
+          f"───")
+    print(f"      {project}")
+    print(f"      {len(ordered)} session(s):\n")
+    width = len(str(len(ordered)))
+    for index, sess in enumerate(ordered, 1):
+        span = None
+        if sess.started and sess.ended:
+            span = (sess.ended - sess.started).total_seconds()
+        preview = f'"{sess.preview}"' if sess.preview else "(no typed prompt)"
+        print(f"    {index:>{width}}  {fmt_ts(sess.started)}  "
+              f"{human_duration(span):>7}  {sess.records:>5} rec  "
+              f"{human_bytes(sess.size):>10}  {LABELS[sess.agent]}")
+        print(f"    {'':>{width}}  {preview}")
+
+    if ask_yes_no(f"\n  Exclude ALL {len(ordered)} session(s) of project "
+                  f"[{number}]?", default=True):
+        print(f"  -> excluding all {len(ordered)} session(s) of [{number}]")
+        return []
+    drop = ask_numbers(f"  Which sessions of project [{number}] should be "
+                       f"excluded?", len(ordered))
+    kept = [s for i, s in enumerate(ordered, 1) if i not in drop]
+    print(f"  -> keeping {len(kept)} of {len(ordered)} session(s) "
+          f"of [{number}]")
+    return kept
+
+
+def _count_by(items, key):
+    counts = defaultdict(int)
+    for item in items:
+        counts[key(item)] += 1
+    return counts
+
+
+# --------------------------------------------------------------------------- #
+# Stats
+# --------------------------------------------------------------------------- #
+
+def build_stats(sessions, start_date, end_date, kinds, extras=(), sources=None):
+    per_agent_count = defaultdict(int)
+    per_agent_day = defaultdict(lambda: defaultdict(int))
+    projects_per_agent = defaultdict(set)
+    records_per_agent = defaultdict(int)
+    bytes_per_agent = defaultdict(int)
+    files_per_agent = defaultdict(int)
+
+    for sess in sessions:
+        label = LABELS[sess.agent]
+        per_agent_count[label] += 1
+        projects_per_agent[label].add(sess.project)
+        records_per_agent[label] += sess.records
+        kept = sess.kept_artifacts(kinds)
+        bytes_per_agent[label] += sum(a.size for a in kept)
+        files_per_agent[label] += len(kept)
+        day = sess.started.astimezone().date().isoformat() if sess.started \
+            else "unknown"
+        per_agent_day[label][day] += 1
+
+    # Files that belong to a project rather than to one session (agent memory,
+    # session indexes) still count towards what the zip holds.
+    for group, art in extras:
+        label = LABELS.get(str(group).split(":", 1)[0])
+        if label is None:
+            continue
+        bytes_per_agent[label] += art.size
+        files_per_agent[label] += 1
+
+    # Where each agent's logs came from, and how many survived each stage.
+    # Counts only — never the name of anything that was left out.
+    per_agent = {}
+    for key, info in sorted((sources or {}).items()):
+        label = LABELS[key]
+        per_agent[label] = {
+            "roots": info.get("roots", []),
+            "root_source": info.get("root_source"),
+            "sessions_found": info.get("found", 0),
+            "sessions_in_window": info.get("in_window", 0),
+            "sessions_selected": info.get("selected", 0),
+            "sessions_exported": per_agent_count.get(label, 0),
+            "projects_exported": len(projects_per_agent.get(label, ())),
+            "files_exported": files_per_agent.get(label, 0),
+            "bytes_exported": bytes_per_agent.get(label, 0),
+            "message_records": records_per_agent.get(label, 0),
+        }
+
+    days = _window_days(sessions, start_date, end_date)
+    per_agent_day_full = {}
+    for label, counts in sorted(per_agent_day.items()):
+        row = {day: counts.get(day, 0) for day in days}
+        if "unknown" in counts:
+            row["unknown"] = counts["unknown"]
+        per_agent_day_full[label] = row
+
+    total_day = {day: sum(row.get(day, 0) for row in per_agent_day.values())
+                 for day in days}
+    return {
+        "totals": {
+            "sessions": len(sessions),
+            "projects": len({s.project for s in sessions}),
+            "agents": len(per_agent_count),
+            "files": sum(files_per_agent.values()),
+            "bytes": sum(bytes_per_agent.values()),
+            "message_records": sum(records_per_agent.values()),
+            "sessions_found": sum(v["sessions_found"] for v in per_agent.values()),
+            "sessions_in_window": sum(v["sessions_in_window"]
+                                      for v in per_agent.values()),
+            "sessions_selected": sum(v["sessions_selected"]
+                                     for v in per_agent.values()),
+        },
+        "per_agent": per_agent,
+        "sessions_per_agent": dict(sorted(per_agent_count.items())),
+        "projects_per_agent": {k: len(v) for k, v in sorted(projects_per_agent.items())},
+        "message_records_per_agent": dict(sorted(records_per_agent.items())),
+        "bytes_per_agent": dict(sorted(bytes_per_agent.items())),
+        "files_per_agent": dict(sorted(files_per_agent.items())),
+        "sessions_per_agent_per_day": per_agent_day_full,
+        "sessions_per_day": total_day,
+    }
+
+
+def _window_days(sessions, start_date, end_date):
+    """Every day in the window, so gaps are visible as explicit zeros."""
+    dates = [s.started.astimezone().date() for s in sessions if s.started]
+    first = start_date or (min(dates) if dates else None)
+    last = end_date or (max(dates) if dates else None)
+    if first is None or last is None or last < first:
+        return []
+    if (last - first).days > 3660:                      # a decade of keys is noise
+        return sorted({d.isoformat() for d in dates})
+    out, day = [], first
+    while day <= last:
+        out.append(day.isoformat())
+        day += timedelta(days=1)
+    return out
+
+
+def stats_text(stats, window):
+    lines = ["agent-logs export summary", "=" * 40, ""]
+    lines.append(f"window            {window['start'] or 'all time'} .. "
+                 f"{window['end'] or 'today'}  (local dates, inclusive)")
+    totals = stats["totals"]
+    lines += [
+        f"sessions          {totals['sessions']}",
+        f"projects          {totals['projects']}",
+        f"files             {totals['files']}",
+        f"uncompressed      {human_bytes(totals['bytes'])}",
+        f"message records   {totals['message_records']} (approximate; exact "
+        f"counts come from the parser)",
+        "", "sessions per agent", "-" * 40,
+    ]
+    for label, count in stats["sessions_per_agent"].items():
+        lines.append(f"  {label:<20} {count:>6}  "
+                     f"({stats['projects_per_agent'][label]} project(s), "
+                     f"{human_bytes(stats['bytes_per_agent'][label])})")
+
+    if stats.get("per_agent"):
+        lines += ["", "where each agent's logs came from, and what got through",
+                  "-" * 72,
+                  f"  {'agent':<20}{'on disk':>9}{'in window':>11}"
+                  f"{'selected':>10}{'exported':>10}   source"]
+        for label, info in stats["per_agent"].items():
+            lines.append(
+                f"  {label:<20}{info['sessions_found']:>9}"
+                f"{info['sessions_in_window']:>11}{info['sessions_selected']:>10}"
+                f"{info['sessions_exported']:>10}   {info['root_source']}")
+            for root in info["roots"]:
+                lines.append(f"  {'':<20}{root}")
+    lines += ["", "sessions per day", "-" * 40]
+    labels = list(stats["sessions_per_agent"])
+    header = "  date        " + "".join(f"{l[:12]:>14}" for l in labels) + "         total"
+    lines.append(header)
+    for day, total in stats["sessions_per_day"].items():
+        if total == 0:
+            continue
+        row = "".join(
+            f"{stats['sessions_per_agent_per_day'].get(l, {}).get(day, 0):>14}"
+            for l in labels)
+        lines.append(f"  {day}{row}{total:>14}")
+    unknown = {l: r.get("unknown", 0)
+               for l, r in stats["sessions_per_agent_per_day"].items()
+               if r.get("unknown")}
+    if unknown:
+        lines.append("")
+        lines.append("  sessions with no usable timestamp: "
+                     + ", ".join(f"{l} {n}" for l, n in unknown.items()))
+    return "\n".join(lines) + "\n"
+
+
+def zip_readme(manifest, stats):
+    """The note that travels inside the zip.
+
+    Whoever opens this is either the person who made it, checking what they are
+    about to send, or the person they sent it to. Neither needs to know how it
+    will be processed afterwards, so this says what the archive holds and
+    nothing more.
+    """
+    window = manifest["window"]
+    span = (f"{window['start']} to {window['end']}" if window["start"]
+            else f"everything up to {window['end']}")
+    per_agent = "\n".join(
+        f"      {label:<20} {count} session(s)"
+        for label, count in stats["sessions_per_agent"].items())
+    totals = stats["totals"]
+    return f"""\
+agent-logs export
+=================
+
+Coding-agent session logs, copied from the machine that made this file. They are the originals, byte for byte: nothing was rewritten, summarised, filtered by content, or uploaded anywhere. Making this archive was the only thing that happened.
+
+  Days covered   {span}
+  Contents       {totals['sessions']} session(s) from {totals['projects']} project(s), {totals['files']} file(s)
+
+{per_agent}
+
+What is in here
+---------------
+
+  logs/<agent>/   the session transcripts, in their original folder layout
+  manifest.json   one entry per file: which agent and session it came from, the project folder it belongs to, timestamps, size, checksum
+  stats.json      session counts per agent, and per agent per day
+  stats.txt       the same counts, as a table
+
+Because these are complete transcripts, they contain whatever those sessions contained: the messages that were typed, the model's replies, the commands the agent ran, file paths on that machine, and parts of any files it read.
+
+Anything left out during the export is not captured. The manifest records how many projects and sessions were skipped, never which ones.
+
+Two of the agents keep conversations in a database rather than in files (OpenCode, Cursor). Those were read without modifying them and written out as JSON, so every session is a file like all the others.
+"""
+
+
+# --------------------------------------------------------------------------- #
+# Writing the zip
+# --------------------------------------------------------------------------- #
+
+def write_zip(out_path, sessions, extras, kinds, window, quiet=False,
+              sources=None):
+    manifest_files = []
+    skipped = []
+    groups_used = {s.group for s in sessions}
+    extra_pairs = [(group, a) for group, items in sorted(extras.items())
+                   if group in groups_used for a in items if a.kind in kinds]
+    stats = build_stats(sessions, window["start_date"], window["end_date"],
+                        kinds, extra_pairs, sources)
+    # (session, agent_key, artifact) — project-level extras have no session.
+    queue = [(s, s.agent, a) for s in sessions for a in s.kept_artifacts(kinds)]
+    queue += [(None, str(g).split(":", 1)[0], a) for g, a in extra_pairs]
+
+    seen_arcs = set()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Build under a temporary name and rename at the end, so an interrupted run
+    # cannot leave a truncated zip sitting there looking ready to send.
+    partial = out_path.with_name(out_path.name + ".part")
+    with zipfile.ZipFile(partial, "w", zipfile.ZIP_DEFLATED,
+                         allowZip64=True) as zf:
+        total = len(queue)
+        for index, (sess, agent_key, art) in enumerate(queue, 1):
+            arc = _unique(art.arc, seen_arcs)
+            if not quiet and (index % 25 == 0 or index == total):
+                print(f"\r  writing {index}/{total} files…", end="", file=sys.stderr)
+            try:
+                digest, size = _add(zf, arc, art)
+            except OSError as exc:
+                skipped.append({"path": str(art.path), "reason": str(exc)})
+                continue
+            entry = {
+                "arcname": arc,
+                "agent": LABELS.get(agent_key),
+                "agent_key": agent_key,
+                "kind": art.kind,
+                "bytes": size,
+                "sha256": digest,
+                "source_path": str(art.path) if art.path else None,
+                "synthesized": art.path is None,
+            }
+            if sess is not None:
+                entry.update({
+                    "session_id": sess.session_id,
+                    "project": sess.project,
+                    "started_at": sess.started.isoformat() if sess.started else None,
+                    "ended_at": sess.ended.isoformat() if sess.ended else None,
+                })
+                if sess.ts_from_mtime:
+                    entry["timestamps_from_file_mtime"] = True
+            manifest_files.append(entry)
+        if not quiet and total:
+            print(file=sys.stderr)
+
+        manifest = {
+            "tool": "agent-logs",
+            "format_version": 1,
+            "tool_version": VERSION,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "window": {"start": window["start_date"].isoformat()
+                       if window["start_date"] else None,
+                       "end": window["end_date"].isoformat()
+                       if window["end_date"] else None,
+                       "timezone": str(datetime.now().astimezone().tzinfo)},
+            "included_kinds": sorted(kinds),
+            "counts": {
+                "sessions": len(sessions),
+                "projects": len({s.project for s in sessions}),
+                "files": len(manifest_files),
+                "excluded_projects": window.get("excluded_projects", 0),
+                "excluded_sessions": window.get("excluded_sessions", 0),
+                "skipped_files": len(skipped),
+            },
+            "environment": {
+                "os": platform.system(),
+                "os_release": platform.release(),
+                "python": platform.python_version(),
+                "command": " ".join(sys.argv),
+            },
+            "skipped": skipped,
+            "files": manifest_files,
+        }
+        zf.writestr("manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False))
+        zf.writestr("stats.json", json.dumps(
+            {"window": manifest["window"], "generated_at": manifest["generated_at"],
+             **stats}, indent=2, ensure_ascii=False))
+        zf.writestr("stats.txt", stats_text(
+            stats, {"start": manifest["window"]["start"],
+                    "end": manifest["window"]["end"]}))
+        zf.writestr("README.txt", zip_readme(manifest, stats))
+    os.replace(partial, out_path)
+    return stats, manifest, skipped
+
+
+def _unique(arc, seen):
+    if arc not in seen:
+        seen.add(arc)
+        return arc
+    stem, dot, suffix = arc.rpartition(".")
+    counter = 2
+    while True:
+        candidate = f"{stem}-{counter}{dot}{suffix}" if dot else f"{arc}-{counter}"
+        if candidate not in seen:
+            seen.add(candidate)
+            return candidate
+        counter += 1
+
+
+def _add(zf, arc, art):
+    """Stream one artifact into the zip, hashing it on the way through."""
+    digest = hashlib.sha256()
+    if art.data is not None:
+        digest.update(art.data)
+        zf.writestr(arc, art.data)
+        return digest.hexdigest(), len(art.data)
+    size = 0
+    with open(art.path, "rb") as src, zf.open(arc, "w") as dst:
+        while True:
+            chunk = src.read(1 << 20)
+            if not chunk:
+                break
+            digest.update(chunk)
+            dst.write(chunk)
+            size += len(chunk)
+    return digest.hexdigest(), size
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+def resolve_agents(values):
+    """--agents claude,codex / --agents claude codex -> canonical keys."""
+    if not values:
+        return None
+    out = []
+    for value in values:
+        for token in re.split(r"[\s,]+", value):
+            token = token.strip().lower()
+            if not token:
+                continue
+            if token == "all":
+                return list(AGENT_KEYS)
+            key = ALIASES.get(token, token)
+            if key not in LABELS:
+                raise SystemExit(
+                    f"agent-logs: unknown agent {token!r}. "
+                    f"Choose from: {', '.join(AGENT_KEYS)}")
+            if key not in out:
+                out.append(key)
+    return out
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="agent-logs",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Bundle local coding-agent session logs into a shareable zip.",
+        epilog="agents: " + ", ".join(f"{k} ({LABELS[k]})" for k in AGENT_KEYS))
+    parser.add_argument("--start-date", default="31d", metavar="DATE",
+                        help="earliest day to include: YYYY-MM-DD, Nd (the "
+                             "last N days, today included) or all "
+                             "(default: 31d)")
+    parser.add_argument("--end-date", default=None, metavar="DATE",
+                        help="latest day to include, inclusive (default: today)")
+    parser.add_argument("--agents", nargs="+", metavar="AGENT",
+                        help="agents to export (default: every one found)")
+    parser.add_argument("-o", "--output", metavar="PATH",
+                        help="zip file, or a directory to put it in "
+                             "(default: ./agent-logs-<timestamp>.zip)")
+    for key in AGENT_KEYS:
+        parser.add_argument(f"--{key}-path", metavar="DIR", action="append",
+                            help=argparse.SUPPRESS)
+    parser.add_argument("--no-subagents", action="store_true",
+                        help="omit subagent transcripts")
+    parser.add_argument("--no-metadata", action="store_true",
+                        help="omit sidecar metadata (*.meta.json, session indexes)")
+    parser.add_argument("--no-tool-results", action="store_true",
+                        help="omit stored tool output files")
+    parser.add_argument("--no-images", action="store_true",
+                        help="omit images and PDF page renders")
+    parser.add_argument("--no-memory", action="store_true",
+                        help="omit per-project agent memory files")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="no questions: export everything in the window")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="show what would be exported, write nothing")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="only print the final summary")
+    parser.add_argument("--version", action="version", version=f"agent-logs {VERSION}")
+    return parser
+
+
+def selected_kinds(args):
+    kinds = set(KINDS)
+    for flag, kind in (("no_subagents", "subagent"), ("no_metadata", "metadata"),
+                       ("no_tool_results", "tool-result"), ("no_images", "image"),
+                       ("no_memory", "memory")):
+        if getattr(args, flag):
+            kinds.discard(kind)
+    return kinds
+
+
+def resolve_output(value):
+    """A zip path from --output: a file, a directory to fill, or nothing."""
+    default = f"agent-logs-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
+    if not value:
+        return Path.cwd() / default
+    path = Path(value).expanduser()
+    if path.is_dir() or str(value).endswith(("/", os.sep)):
+        return path / default
+    return path if path.suffix.lower() == ".zip" else path.with_suffix(".zip")
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    quiet = args.quiet
+    defaulted_window = ("--start-date" not in (argv or sys.argv[1:])
+                        and "--end-date" not in (argv or sys.argv[1:]))
+    start_date = parse_date_arg(args.start_date, "--start-date")
+    end_date = parse_date_arg(args.end_date, "--end-date") or date.today()
+    if start_date and start_date > end_date:
+        raise SystemExit("agent-logs: --start-date is after --end-date")
+    start, end = local_window(start_date, end_date)
+    kinds = selected_kinds(args)
+
+    # 1. Where to look for each agent.
+    requested = resolve_agents(args.agents)
+    if not quiet:
+        print(describe_window(start_date, end_date, defaulted_window),
+              file=sys.stderr)
+
+    # 2. Scan. Every agent on the machine is looked at, so the questions below
+    #    can quote real numbers and so a wrong --<agent>-path can fall back.
+    found_by_agent, all_extras, sources = {}, {}, {}
+    for key in AGENT_KEYS:
+        override = getattr(args, f"{key}_path")
+        paths = [Path(p).expanduser() for p in override] if override \
+            else default_roots(key)
+        kind = "override" if override else "default"
+        found, extras = scan_agent(key, paths)
+
+        # Missing logs are the worst outcome here, so an override that turns up
+        # nothing is treated as a mistake rather than as an instruction: fall
+        # back to the standard location, and say so.
+        if not found and kind == "override":
+            fallback = default_roots(key)
+            alt, alt_extras = scan_agent(key, fallback)
+            if alt:
+                print(f"note: --{key}-path found no sessions in "
+                      f"{', '.join(str(p) for p in paths)}; using the default "
+                      f"location instead", file=sys.stderr)
+                paths, kind, found, extras = fallback, "fallback", alt, alt_extras
+
+        if not found and not any(p.exists() for p in paths):
+            continue                       # this agent is not on this machine
+        sources[key] = {"roots": [str(p) for p in paths if p.exists()],
+                        "root_source": kind, "found": len(found)}
+        all_extras.update(extras)
+        found_by_agent[key] = [s for s in found if in_window(s, start, end)]
+
+    present = list(found_by_agent)
+    if not present:
+        raise SystemExit("agent-logs: no agent logs found on this machine.")
+    for key in (requested or []):
+        if key not in present:
+            print(f"note: no logs found for {LABELS[key]}", file=sys.stderr)
+
+    if not quiet:
+        for key in present:
+            where = "" if sources[key]["root_source"] == "default" \
+                else f"  [--{key}-path]" if sources[key]["root_source"] == "override" \
+                else "  [default, after --%s-path was empty]" % key
+            print(f"  {LABELS[key]:<18} {len(found_by_agent[key]):>4} session(s) "
+                  f"in window (of {sources[key]['found']} found){where}",
+                  file=sys.stderr)
+
+    # 3. Confirm the agent list: anything found but not asked for is offered.
+    chosen = [k for k in (requested or present) if k in present]
+    if requested is not None:
+        others = [k for k in present if k not in chosen and found_by_agent[k]]
+        if others and not args.yes:
+            print()
+            for key in others:
+                count = len(found_by_agent[key])
+                if ask_yes_no(f"{LABELS[key]} also has {count} session(s) in this "
+                              f"window and was not selected. Include it?",
+                              default=False):
+                    chosen.append(key)
+        elif others:
+            print("note: found but not selected: "
+                  + ", ".join(LABELS[k] for k in others), file=sys.stderr)
+
+    for key in present:
+        sources[key]["in_window"] = len(found_by_agent[key])
+        sources[key]["selected"] = len(found_by_agent[key]) if key in chosen else 0
+    all_sessions = [s for k in sorted(chosen, key=AGENT_KEYS.index)
+                    for s in found_by_agent[k]]
+    if not all_sessions:
+        raise SystemExit("agent-logs: no sessions in the selected window.")
+
+    # 3. Narrow down interactively.
+    before = len(all_sessions)
+    projects_before = len({s.project for s in all_sessions})
+    if args.yes:
+        keep = all_sessions
+    else:
+        keep = choose_sessions(all_sessions)
+    if not keep:
+        raise SystemExit("agent-logs: everything was excluded, nothing to write.")
+
+    window = {
+        "start_date": start_date, "end_date": end_date,
+        "excluded_projects": projects_before - len({s.project for s in keep}),
+        "excluded_sessions": before - len(keep),
+    }
+
+    # 4. Write.
+    out_path = resolve_output(args.output)
+    groups = {s.group for s in keep}
+    artifacts = [a for s in keep for a in s.kept_artifacts(kinds)]
+    artifacts += [a for group, items in all_extras.items() if group in groups
+                  for a in items if a.kind in kinds]
+    kept_bytes = sum(a.size for a in artifacts)
+    print(f"\n{len(keep)} session(s) from "
+          f"{len({s.project for s in keep})} project(s): "
+          f"{len(artifacts)} file(s), {human_bytes(kept_bytes)} uncompressed.")
+    if args.dry_run:
+        print(f"Dry run — would write {out_path}")
+        return 0
+    if not args.yes and not ask_yes_no(f"Write {out_path}?", default=True):
+        print("Nothing written.")
+        return 1
+
+    try:
+        stats, manifest, skipped = write_zip(out_path, keep, all_extras, kinds,
+                                             window, quiet, sources)
+    except BaseException:                       # including Ctrl-C mid-write
+        partial = out_path.with_name(out_path.name + ".part")
+        if partial.exists():
+            partial.unlink()
+        raise
+    size = out_path.stat().st_size
+    ratio = f", {100 * size / kept_bytes:.0f}% of {human_bytes(kept_bytes)}" \
+        if kept_bytes else ""
+    print(f"\nWrote {out_path}  ({human_bytes(size)}{ratio})")
+    for label, count in stats["sessions_per_agent"].items():
+        print(f"  {label:<20} {count:>5} session(s)")
+    if skipped:
+        print(f"  {len(skipped)} file(s) could not be read and were skipped "
+              f"(listed in manifest.json)")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(130)
