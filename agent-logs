@@ -217,6 +217,14 @@ INJECTED_PREFIXES = (
     "Base directory for this skill:", "[Request interrupted",
 )
 
+# entrypoint sdk-cli / sdk-ts / sdk-py: the prompt came from a program.
+SCRIPTED_ENTRYPOINTS = ("sdk",)
+
+# Harness wrappers around typed text: the block goes, the prose around it stays.
+INJECTED_BLOCK_RE = re.compile(
+    r"(?s)<(system-reminder|local-command-[a-z]+|command-name|command-message"
+    r"|command-args|ide_[a-z_]*|timestamp)\b[^>]*>.*?</\1>|</?user_query>")
+
 
 def _scan_record(rec, found):
     """Harvest timestamps / cwd / session id from one record, in place."""
@@ -274,17 +282,53 @@ def _record_text(rec):
                 out.append(block)
             elif isinstance(block, dict) and isinstance(block.get("text"), str):
                 out.append(block["text"])
-    return "\n".join(out)
+    text = "\n".join(out)
+    if not text:
+        for key in ("payload", "data"):
+            nested = rec.get(key)
+            if isinstance(nested, dict):
+                text = _record_text(nested)
+                if text:
+                    break
+    return text
 
 
-def _is_user_record(rec):
+def _user_record_kind(rec):
+    """None, "typed", or "echo" — an echo is a second copy of a typed message."""
+    if rec.get("isMeta") or rec.get("isSidechain"):
+        return None
     role = rec.get("role")
-    if not role:
-        msg = rec.get("message")
-        if isinstance(msg, dict):
-            role = msg.get("role")
+    for key in ("message", "payload", "data"):
+        nested = rec.get(key)
+        if not role and isinstance(nested, dict):
+            role = nested.get("role")
     rtype = rec.get("type") or ""
-    return role == "user" or rtype in ("user", "user.message", "user_message")
+    payload = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
+    if rtype.startswith("queue") or (rtype == "response_item" and role == "user"):
+        return "echo"
+    if role == "user" or payload.get("type") == "user_message" \
+            or rtype in ("user", "user.message", "user_message"):
+        return "typed"
+    return None
+
+
+def count_user_messages(candidates):
+    """Messages the human typed, from (text, kind) pairs: no injections, no
+    slash commands, no second copies — but the same text typed twice counts."""
+    typed, echoes = [], set()
+    for raw, kind in candidates:
+        if not isinstance(raw, str):
+            continue
+        text = " ".join(INJECTED_BLOCK_RE.sub("", raw).split())
+        if not text or text.startswith("/") or text.startswith(INJECTED_PREFIXES):
+            continue
+        if kind == "echo":
+            echoes.add(text)
+        else:
+            typed.append(text)
+    duplicated = {e for e in echoes
+                  for t in typed if e == t or (len(t) >= 20 and t in e)}
+    return len(typed) + len(echoes - duplicated)
 
 
 MESSAGE_TYPES = {"user", "assistant", "message", "response_item", "user.message",
@@ -301,10 +345,11 @@ def _is_message_record(rec):
 def peek_transcript(path):
     """Light metadata scan of one transcript. Never builds a trajectory.
 
-    Returns dict(times, cwd, sid, records, preview) — enough to date-filter,
-    group by project and label a session in the exclusion menu.
+    Returns dict(times, cwd, sid, records, user_messages, preview) — enough to
+    date-filter, group by project and label a session in the exclusion menu.
     """
-    found = {"times": [], "cwd": None, "sid": None, "records": 0, "preview": None}
+    found = {"times": [], "cwd": None, "sid": None, "records": 0,
+             "user_messages": 0, "preview": None, "entrypoint": None}
     try:
         raw = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -336,6 +381,7 @@ def peek_transcript(path):
             if isinstance(rec, dict):
                 docs.append(rec)
 
+    candidates, seen_users = [], set()
     for rec in docs:
         if not isinstance(rec, dict):
             continue
@@ -346,10 +392,21 @@ def peek_transcript(path):
                 _scan_record(nested, found)
         if _is_message_record(rec):
             found["records"] += 1
-        if found["preview"] is None and _is_user_record(rec):
-            text = _record_text(rec).strip()
-            if text and not text.startswith(INJECTED_PREFIXES) and not rec.get("isMeta"):
-                found["preview"] = " ".join(text.split())[:70]
+        if not found["entrypoint"] and isinstance(rec.get("entrypoint"), str):
+            found["entrypoint"] = rec["entrypoint"]
+        kind = _user_record_kind(rec)
+        uuid = rec.get("uuid")
+        if kind is None or (uuid and uuid in seen_users):
+            continue
+        seen_users.add(uuid)
+        text = _record_text(rec)
+        candidates.append((text, kind))
+        if found["preview"] is None:
+            clean = " ".join(INJECTED_BLOCK_RE.sub("", text).split())
+            if clean and not clean.startswith(INJECTED_PREFIXES):
+                found["preview"] = clean[:70]
+    if not (found["entrypoint"] or "").startswith(SCRIPTED_ENTRYPOINTS):
+        found["user_messages"] = count_user_messages(candidates)
     return found
 
 
@@ -380,10 +437,12 @@ class Session:
     """One agent session, plus every file that belongs to it."""
 
     __slots__ = ("agent", "session_id", "project", "started", "ended",
-                 "records", "preview", "artifacts", "group", "ts_from_mtime")
+                 "records", "preview", "artifacts", "group", "ts_from_mtime",
+                 "user_messages", "entrypoint")
 
     def __init__(self, agent, session_id, project, started, ended,
-                 records, preview, group, ts_from_mtime=False):
+                 records, preview, group, ts_from_mtime=False,
+                 user_messages=0, entrypoint=None):
         self.agent = agent
         self.session_id = session_id
         self.project = project or "(unknown project)"
@@ -394,6 +453,14 @@ class Session:
         self.artifacts = []
         self.group = group           # extras of this group ride along
         self.ts_from_mtime = ts_from_mtime
+        self.user_messages = user_messages
+        self.entrypoint = entrypoint
+
+    @property
+    def scripted(self):
+        """The entrypoint that ran this session, when it was not a keyboard."""
+        return self.entrypoint if (self.entrypoint or "").startswith(
+            SCRIPTED_ENTRYPOINTS) else None
 
     @property
     def size(self):
@@ -418,7 +485,8 @@ def _session_from_peek(agent, path, arc, group, session_id=None, project=None):
     ended = max(times) if times else started
     sess = Session(agent, session_id or info["sid"] or path.stem,
                    project or info["cwd"], started, ended,
-                   info["records"], info["preview"], group, from_mtime)
+                   info["records"], info["preview"], group, from_mtime,
+                   info["user_messages"], info["entrypoint"])
     sess.artifacts.append(Artifact("session", arc, path=path))
     return sess
 
@@ -607,15 +675,22 @@ def scan_opencode(root, arc_prefix):
             arc = f"{arc_prefix}/{stem}/{sid}.json"
             times = [t for t in (normalize_ts(info.get("time_created")),
                                  normalize_ts(info.get("time_updated"))) if t]
+            typed = []
             for m in messages:
                 ts = normalize_ts((m["info"] or {}).get("time_created"))
                 if ts:
                     times.append(ts)
+                if (m["info"] or {}).get("role") == "user":
+                    typed += [(part.get("text"), "typed")
+                              for part in m.get("parts") or []
+                              if isinstance(part, dict) and part.get("type") == "text"
+                              and not part.get("synthetic")]
             preview = _opencode_preview(messages)
             sess = Session("opencode", sid, info.get("directory"),
                            min(times) if times else None,
                            max(times) if times else None,
-                           len(messages), preview, f"opencode:{db}")
+                           len(messages), preview, f"opencode:{db}",
+                           user_messages=count_user_messages(typed))
             sess.artifacts.append(Artifact("session", arc, data=data))
             sessions.append(sess)
     return sessions, {}
@@ -772,7 +847,7 @@ def _cursor_workspace_session(key, value, folder, ws_name, arc_prefix):
     tabs = (obj or {}).get("tabs") if isinstance(obj, dict) else None
     if not isinstance(tabs, list) or not tabs:
         return None
-    lines, count, preview = [], 0, None
+    lines, count, preview, typed = [], 0, None, []
     header = {"cursor_session": {"source": key, "workspace": ws_name,
                                  "directory": folder}}
     lines.append(json.dumps(header, ensure_ascii=False))
@@ -787,6 +862,8 @@ def _cursor_workspace_session(key, value, folder, ws_name, arc_prefix):
             lines.append(json.dumps({"role": role, "message": text,
                                      "cursor_raw": bubble}, ensure_ascii=False))
             count += 1
+            if role == "user":
+                typed.append((text, "typed"))
             if role == "user" and preview is None and text.strip():
                 preview = " ".join(text.split())[:70]
     if count == 0:
@@ -796,7 +873,8 @@ def _cursor_workspace_session(key, value, folder, ws_name, arc_prefix):
     # These bubbles carry no timestamps at all, so the session is undateable;
     # in_window() keeps it rather than dropping it on a guess.
     sess = Session("cursor", f"{ws_name}-chatdata", folder, None, None,
-                   count, preview, f"cursor:{ws_name}")
+                   count, preview, f"cursor:{ws_name}",
+                   user_messages=count_user_messages(typed))
     sess.artifacts.append(Artifact("session", arc, data=data))
     return sess
 
@@ -852,7 +930,7 @@ def _cursor_global_sessions(db_path, folders, arc_prefix):
             "lastUpdatedAt": header.get("lastUpdatedAt")}}, ensure_ascii=False)]
         times = [t for t in (normalize_ts(header.get("createdAt")),
                              normalize_ts(header.get("lastUpdatedAt"))) if t]
-        preview, count = None, 0
+        preview, count, typed = None, 0, []
         for _bid, bubble in ordered:
             if not isinstance(bubble, dict):
                 continue
@@ -864,13 +942,16 @@ def _cursor_global_sessions(db_path, folders, arc_prefix):
             lines.append(json.dumps({"role": role, "message": text,
                                      "cursor_raw": bubble}, ensure_ascii=False))
             count += 1
+            if role == "user":
+                typed.append((text, "typed"))
             if role == "user" and preview is None and text.strip():
                 preview = " ".join(text.split())[:70]
         data = ("\n".join(lines) + "\n").encode("utf-8")
         sess = Session("cursor", cid, folder,
                        min(times) if times else None,
                        max(times) if times else None,
-                       count, preview, f"cursor:{db_path}")
+                       count, preview, f"cursor:{db_path}",
+                       user_messages=count_user_messages(typed))
         sess.artifacts.append(Artifact("session", f"{arc_prefix}/{cid}.jsonl", data=data))
         sessions.append(sess)
     return sessions
@@ -1039,7 +1120,10 @@ def choose_sessions(sessions, quiet=False):
         agents = ", ".join(f"{LABELS[a]} {n}" for a, n in
                            sorted(_count_by(group, lambda s: s.agent).items()))
         print(f"  [{index:>{width}}]  {project}")
-        print(f"   {'':>{width}}   {len(group)} session(s), "
+        scripted = [s.scripted for s in group if s.scripted]
+        print(f"   {'':>{width}}   {len(group)} session(s)"
+              f"{f' ({len(scripted)} {sorted(set(scripted))[0]})' if scripted else ''}, "
+              f"{sum(s.user_messages for s in group)} user message(s), "
               f"{human_bytes(sum(s.size for s in group))} — {agents}")
 
     if ask_yes_no(f"\nExport all {len(projects)} project(s)?", default=True):
@@ -1081,9 +1165,10 @@ def _choose_within_project(project, sessions, number, position, total):
         if sess.started and sess.ended:
             span = (sess.ended - sess.started).total_seconds()
         preview = f'"{sess.preview}"' if sess.preview else "(no typed prompt)"
+        label = LABELS[sess.agent] + (f" — {sess.scripted}" if sess.scripted else "")
         print(f"    {index:>{width}}  {fmt_ts(sess.started)}  "
-              f"{human_duration(span):>7}  {sess.records:>5} rec  "
-              f"{human_bytes(sess.size):>10}  {LABELS[sess.agent]}")
+              f"{human_duration(span):>7}  {sess.user_messages:>3} msg  "
+              f"{human_bytes(sess.size):>10}  {label}")
         print(f"    {'':>{width}}  {preview}")
 
     if ask_yes_no(f"\n  Exclude ALL {len(ordered)} session(s) of project "
@@ -1114,6 +1199,7 @@ def build_stats(sessions, start_date, end_date, kinds, extras=(), sources=None):
     per_agent_day = defaultdict(lambda: defaultdict(int))
     projects_per_agent = defaultdict(set)
     records_per_agent = defaultdict(int)
+    user_msgs_per_agent = defaultdict(int)
     bytes_per_agent = defaultdict(int)
     files_per_agent = defaultdict(int)
 
@@ -1122,6 +1208,7 @@ def build_stats(sessions, start_date, end_date, kinds, extras=(), sources=None):
         per_agent_count[label] += 1
         projects_per_agent[label].add(sess.project)
         records_per_agent[label] += sess.records
+        user_msgs_per_agent[label] += sess.user_messages
         kept = sess.kept_artifacts(kinds)
         bytes_per_agent[label] += sum(a.size for a in kept)
         files_per_agent[label] += len(kept)
@@ -1154,6 +1241,7 @@ def build_stats(sessions, start_date, end_date, kinds, extras=(), sources=None):
             "files_exported": files_per_agent.get(label, 0),
             "bytes_exported": bytes_per_agent.get(label, 0),
             "message_records": records_per_agent.get(label, 0),
+            "user_messages": user_msgs_per_agent.get(label, 0),
         }
 
     days = _window_days(sessions, start_date, end_date)
@@ -1174,6 +1262,7 @@ def build_stats(sessions, start_date, end_date, kinds, extras=(), sources=None):
             "files": sum(files_per_agent.values()),
             "bytes": sum(bytes_per_agent.values()),
             "message_records": sum(records_per_agent.values()),
+            "user_messages": sum(user_msgs_per_agent.values()),
             "sessions_found": sum(v["sessions_found"] for v in per_agent.values()),
             "sessions_in_window": sum(v["sessions_in_window"]
                                       for v in per_agent.values()),
@@ -1184,6 +1273,7 @@ def build_stats(sessions, start_date, end_date, kinds, extras=(), sources=None):
         "sessions_per_agent": dict(sorted(per_agent_count.items())),
         "projects_per_agent": {k: len(v) for k, v in sorted(projects_per_agent.items())},
         "message_records_per_agent": dict(sorted(records_per_agent.items())),
+        "user_messages_per_agent": dict(sorted(user_msgs_per_agent.items())),
         "bytes_per_agent": dict(sorted(bytes_per_agent.items())),
         "files_per_agent": dict(sorted(files_per_agent.items())),
         "sessions_per_agent_per_day": per_agent_day_full,
@@ -1217,6 +1307,7 @@ def stats_text(stats, window):
         f"projects          {totals['projects']}",
         f"files             {totals['files']}",
         f"uncompressed      {human_bytes(totals['bytes'])}",
+        f"user messages     {totals['user_messages']}",
         f"message records   {totals['message_records']} (approximate; exact "
         f"counts come from the parser)",
         "", "sessions per agent", "-" * 40,
@@ -1224,6 +1315,7 @@ def stats_text(stats, window):
     for label, count in stats["sessions_per_agent"].items():
         lines.append(f"  {label:<20} {count:>6}  "
                      f"({stats['projects_per_agent'][label]} project(s), "
+                     f"{stats['user_messages_per_agent'][label]} user message(s), "
                      f"{human_bytes(stats['bytes_per_agent'][label])})")
 
     if stats.get("per_agent"):
@@ -1281,7 +1373,7 @@ agent-logs export
 Coding-agent session logs, copied from the machine that made this file. They are the originals, byte for byte: nothing was rewritten, summarised, filtered by content, or uploaded anywhere. Making this archive was the only thing that happened.
 
   Days covered   {span}
-  Contents       {totals['sessions']} session(s) from {totals['projects']} project(s), {totals['files']} file(s)
+  Contents       {totals['sessions']} session(s) from {totals['projects']} project(s), {totals['files']} file(s), {totals['user_messages']} message(s) typed
 
 {per_agent}
 
@@ -1373,6 +1465,7 @@ def write_zip(out_path, sessions, extras, kinds, window, quiet=False,
                 "sessions": len(sessions),
                 "projects": len({s.project for s in sessions}),
                 "files": len(manifest_files),
+                "user_messages": sum(s.user_messages for s in sessions),
                 "excluded_projects": window.get("excluded_projects", 0),
                 "excluded_sessions": window.get("excluded_sessions", 0),
                 "skipped_files": len(skipped),
@@ -1578,8 +1671,9 @@ def main(argv=None):
                 else f"  [--{key}-path]" if sources[key]["root_source"] == "override" \
                 else "  [default, after --%s-path was empty]" % key
             print(f"  {LABELS[key]:<18} {len(found_by_agent[key]):>4} session(s) "
-                  f"in window (of {sources[key]['found']} found){where}",
-                  file=sys.stderr)
+                  f"in window (of {sources[key]['found']} found), "
+                  f"{sum(s.user_messages for s in found_by_agent[key])} "
+                  f"user message(s){where}", file=sys.stderr)
 
     # 3. Confirm the agent list: anything found but not asked for is offered.
     chosen = [k for k in (requested or present) if k in present]
@@ -1629,7 +1723,8 @@ def main(argv=None):
                   for a in items if a.kind in kinds]
     kept_bytes = sum(a.size for a in artifacts)
     print(f"\n{len(keep)} session(s) from "
-          f"{len({s.project for s in keep})} project(s): "
+          f"{len({s.project for s in keep})} project(s), "
+          f"{sum(s.user_messages for s in keep)} user message(s): "
           f"{len(artifacts)} file(s), {human_bytes(kept_bytes)} uncompressed.")
     if args.dry_run:
         print(f"Dry run — would write {out_path}")
@@ -1651,7 +1746,8 @@ def main(argv=None):
         if kept_bytes else ""
     print(f"\nWrote {out_path}  ({human_bytes(size)}{ratio})")
     for label, count in stats["sessions_per_agent"].items():
-        print(f"  {label:<20} {count:>5} session(s)")
+        print(f"  {label:<20} {count:>5} session(s), "
+              f"{stats['user_messages_per_agent'][label]:>5} user message(s)")
     if skipped:
         print(f"  {len(skipped)} file(s) could not be read and were skipped "
               f"(listed in manifest.json)")

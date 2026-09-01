@@ -36,9 +36,9 @@ By default it covers the last 31 days.
 
 It walks you through three questions:
 
-1. **Agents.** If it finds logs from a coding agent you did not ask for, it tells you how many sessions and asks whether to include them.
-2. **Projects.** It lists every project folder you have used an agent in, with the number of sessions and the size, then asks whether to export all of them. If not, you give the numbers of the ones to leave out — `3 7 12-15` or `3,7,12-15`.
-3. **Sessions.** For each project you left out, it lists the individual sessions with their date, length, size and opening message, and asks whether to drop all of them or only some.
+1. **Agents.** If it finds logs from a coding agent you did not ask for, it tells you how many sessions and prompts it found and asks whether to include them.
+2. **Projects.** It lists every project folder you have used an agent in, with the number of sessions, the number of prompts and the size, then asks whether to export all of them. If not, you give the numbers of the ones to leave out — `3 7 12-15` or `3,7,12-15`.
+3. **Sessions.** For each project you left out, it lists the individual sessions with their date, length, size, number of prompts and opening message, and asks whether to drop all of them or only some.
 
 Anything you exclude is not included in the zip.
 
@@ -61,7 +61,7 @@ You will probably not need any of these, but:
 
 ## What ends up in the zip
 
-The zip contains the transcript files, plus a `README.txt` and counts of how many sessions came from each agent. Because they are complete transcripts, they contain what those sessions contained: the messages you typed, the model's replies, the commands the agent ran, file paths on your machine, and parts of files it read.
+The zip contains the transcript files, plus a `README.txt` and counts of how many sessions and prompts came from each agent. Because they are complete transcripts, they contain what those sessions contained: the messages you typed, the model's replies, the commands the agent ran, file paths on your machine, and parts of files it read.
 
 ## If something goes wrong
 
