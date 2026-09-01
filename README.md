@@ -1,4 +1,4 @@
-# agent-logs
+# Exporting coding agent session logs
 
 Collects the session logs your coding agents already write on your own machine and puts copies of them in a single zip file.
 
